@@ -1,11 +1,14 @@
 # coding=utf-8
-from __future__ import absolute_import
-
+# OctoPrint requires the package name to match its case-sensitive plugin identifier.
+# pylint: disable=invalid-name
 """
 Transport support for Marlin's M6400 base64 SD-card download command.
 """
 
+from __future__ import absolute_import
+
 import base64
+import binascii
 import io
 import re
 import threading
@@ -13,14 +16,16 @@ import threading
 import octoprint.plugin
 from octoprint.access.permissions import Permissions
 from octoprint.filemanager.destinations import FileDestinations
+# This import is provided by OctoPrint and is absent from standalone lint environments.
+# pylint: disable-next=import-error,no-name-in-module
+from octoprint.filemanager.storage.common import StorageError
 from octoprint.filemanager.util import StreamWrapper
-
 
 _B64_BEGIN = re.compile(r"^B64_BEGIN\s+(?P<filename>\S+)\s+(?P<size>\d+)\s*$")
 _B64_DATA = re.compile(r"^B64_DATA\s+(?P<data>[A-Za-z0-9+/=]+)\s*$")
 
 
-class M6400DownloadPlugin(
+class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
     octoprint.plugin.SettingsPlugin,
     octoprint.plugin.AssetPlugin,
     octoprint.plugin.TemplatePlugin,
@@ -30,7 +35,7 @@ class M6400DownloadPlugin(
     Receive M6400 responses without blocking OctoPrint's serial read loop.
     """
 
-    def __init__(self):
+    def __init__(self):  # pylint: disable=super-init-not-called
         self._download_lock = threading.RLock()
         self._download_buffer = io.StringIO()
         self._download_filename = None
@@ -42,6 +47,9 @@ class M6400DownloadPlugin(
     ##~~ Download transport
 
     def get_api_commands(self):
+        """
+        Provide a simple API command for download requests.
+        """
         return {"download": ["filename"]}
 
     def is_api_protected(self):
@@ -52,11 +60,15 @@ class M6400DownloadPlugin(
 
     @Permissions.FILES_DOWNLOAD.require(403)
     def on_api_command(self, command, data):
+        """
+        Handle a download request.
+        """
         if command == "download":
             try:
                 self.request_download(data["filename"], force=data.get("force", False))
             except FileExistsError:
                 return {"error": "file_exists"}, 409
+        return None
 
     def request_download(self, filename, force=False):
         """
@@ -77,7 +89,7 @@ class M6400DownloadPlugin(
             if self._download_status in ("waiting", "receiving", "saving"):
                 raise RuntimeError("an M6400 download is already in progress")
             if not force and self._file_manager.file_exists(FileDestinations.LOCAL, filename):
-                raise FileExistsError("a local file named '{0}' already exists".format(filename))
+                raise FileExistsError(f"a local file named '{filename}' already exists")
 
             self._download_buffer = io.StringIO()
             self._download_filename = filename
@@ -87,8 +99,11 @@ class M6400DownloadPlugin(
             self._download_error = None
 
         try:
-            self._printer.commands(["M6400 {0}".format(filename)], tags={"m6400download"})
-        except Exception:
+            self._printer.commands(
+                [f"M6400 {filename}"],
+                tags={"m6400download"},
+            )
+        except RuntimeError:
             with self._download_lock:
                 self._download_status = "failed"
                 self._download_error = "Failed to queue M6400 command"
@@ -116,7 +131,7 @@ class M6400DownloadPlugin(
                 "error": self._download_error,
             }
 
-    def process_received_line(self, comm_instance, line, *args, **kwargs):
+    def process_received_line(self, _comm_instance, line, *_args, **_kwargs):
         """
         Collect M6400 protocol lines and always preserve serial processing.
         """
@@ -142,7 +157,8 @@ class M6400DownloadPlugin(
                     name="M6400Download-save",
                     daemon=True,
                 ).start()
-            elif line.strip() == "B64_FAILURE" and self._download_status in ("waiting", "receiving"):
+            elif line.strip() == "B64_FAILURE" \
+                    and self._download_status in ("waiting", "receiving"):
                 self._download_status = "failed"
                 self._download_error = "Firmware reported an M6400 transfer failure"
             elif line.startswith("Error:") and self._download_status == "waiting":
@@ -161,7 +177,7 @@ class M6400DownloadPlugin(
             contents = base64.b64decode(encoded_data.encode("ascii"), validate=True)
             if len(contents) != expected_size:
                 raise ValueError(
-                    "received {0} bytes, expected {1}".format(len(contents), expected_size)
+                    f"received {len(contents)} bytes, expected {expected_size}"
                 )
             file_object = StreamWrapper(filename, io.BytesIO(contents))
             saved_path = self._file_manager.add_file(
@@ -170,10 +186,10 @@ class M6400DownloadPlugin(
                 file_object,
                 allow_overwrite=force,
             )
-        except Exception as error:
+        except (binascii.Error, UnicodeError, ValueError, StorageError, OSError) as error:
             with self._download_lock:
                 self._download_status = "failed"
-                self._download_error = "Could not save downloaded file: {0}".format(error)
+                self._download_error = f"Could not save downloaded file: {error}"
         else:
             with self._download_lock:
                 self._download_status = "complete"
@@ -204,6 +220,7 @@ class M6400DownloadPlugin(
     ##~~ Softwareupdate hook
 
     def get_update_information(self):
+        """Describe this plugin to OctoPrint's software update system."""
         return {
             "M6400Download": {
                 "displayName": "M6400Download Plugin",
@@ -212,23 +229,32 @@ class M6400DownloadPlugin(
                 "user": "kaedenn",
                 "repo": "OctoPrint-M6400Download",
                 "current": self._plugin_version,
-                "pip": "https://github.com/kaedenn/OctoPrint-M6400Download/archive/{target_version}.zip",
+                "pip": (
+                    "https://github.com/kaedenn/OctoPrint-M6400Download/"
+                    "archive/{target_version}.zip"
+                ),
             }
         }
 
 
 __plugin_name__ = "M6400Download Plugin"
 __plugin_pythoncompat__ = ">=3,<4"
+__plugin_implementation__ = None
+__plugin_hooks__ = None
 
 
 def __plugin_load__():
-    global __plugin_implementation__
+    global __plugin_implementation__  # pylint: disable=global-statement
     __plugin_implementation__ = M6400DownloadPlugin()
 
-    global __plugin_hooks__
+    global __plugin_hooks__  # pylint: disable=global-statement
     __plugin_hooks__ = {
-        "octoprint.comm.protocol.gcode.received": __plugin_implementation__.process_received_line,
-        "octoprint.plugin.softwareupdate.check_config": __plugin_implementation__.get_update_information,
+        "octoprint.comm.protocol.gcode.received": (
+            __plugin_implementation__.process_received_line
+        ),
+        "octoprint.plugin.softwareupdate.check_config": (
+            __plugin_implementation__.get_update_information
+        ),
     }
 
 # vim: set ts=4 sts=4 sw=4:

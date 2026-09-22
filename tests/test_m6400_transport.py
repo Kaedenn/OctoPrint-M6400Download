@@ -50,6 +50,8 @@ access_module.permissions = permissions_module
 octoprint_module.access = access_module
 filemanager_module = types.ModuleType("octoprint.filemanager")
 destinations_module = types.ModuleType("octoprint.filemanager.destinations")
+storage_module = types.ModuleType("octoprint.filemanager.storage")
+storage_common_module = types.ModuleType("octoprint.filemanager.storage.common")
 util_module = types.ModuleType("octoprint.filemanager.util")
 
 
@@ -66,9 +68,15 @@ class _StreamWrapper(object):
         return self._stream
 
 
+class _StorageError(Exception):
+    pass
+
+
 destinations_module.FileDestinations = _FileDestinations
+storage_common_module.StorageError = _StorageError
 util_module.StreamWrapper = _StreamWrapper
 filemanager_module.destinations = destinations_module
+filemanager_module.storage = storage_module
 filemanager_module.util = util_module
 octoprint_module.filemanager = filemanager_module
 sys.modules.setdefault("octoprint", octoprint_module)
@@ -77,6 +85,8 @@ sys.modules.setdefault("octoprint.access", access_module)
 sys.modules.setdefault("octoprint.access.permissions", permissions_module)
 sys.modules.setdefault("octoprint.filemanager", filemanager_module)
 sys.modules.setdefault("octoprint.filemanager.destinations", destinations_module)
+sys.modules.setdefault("octoprint.filemanager.storage", storage_module)
+sys.modules.setdefault("octoprint.filemanager.storage.common", storage_common_module)
 sys.modules.setdefault("octoprint.filemanager.util", util_module)
 
 from octoprint_M6400Download import M6400DownloadPlugin
@@ -88,6 +98,14 @@ class FakePrinter(object):
 
     def commands(self, commands, tags=None):
         self.calls.append((commands, tags))
+
+
+class FailingPrinter(object):
+    def __init__(self, error):
+        self.error = error
+
+    def commands(self, commands, tags=None):
+        raise self.error
 
 
 class FakeFileManager(object):
@@ -103,6 +121,15 @@ class FakeFileManager(object):
             raise FileExistsError(filename)
         self.files[filename] = file_object.stream().read()
         return self.saved_path or filename
+
+
+class FailingFileManager(FakeFileManager):
+    def __init__(self, error):
+        super(FailingFileManager, self).__init__()
+        self.error = error
+
+    def add_file(self, destination, filename, file_object, allow_overwrite=False):
+        raise self.error
 
 
 class FakePluginManager(object):
@@ -181,6 +208,44 @@ class M6400TransportTest(unittest.TestCase):
     def test_rejects_ambiguous_filenames(self):
         with self.assertRaises(ValueError):
             self.plugin.request_download("cube file.gcode")
+
+    def test_queue_runtime_error_marks_download_failed(self):
+        self.plugin._printer = FailingPrinter(RuntimeError("printer unavailable"))
+
+        with self.assertRaises(RuntimeError):
+            self.plugin.request_download("cube.gcode")
+
+        self.assertEqual("failed", self.plugin.get_download_state()["status"])
+        self.assertEqual(
+            "Failed to queue M6400 command",
+            self.plugin.get_download_state()["error"],
+        )
+
+    def test_queue_programming_error_is_not_handled(self):
+        self.plugin._printer = FailingPrinter(TypeError("bad printer call"))
+
+        with self.assertRaises(TypeError):
+            self.plugin.request_download("cube.gcode")
+
+        self.assertEqual("waiting", self.plugin.get_download_state()["status"])
+
+    def test_storage_error_marks_download_failed(self):
+        self.plugin._file_manager = FailingFileManager(_StorageError("disk full"))
+
+        self.plugin._save_download("cube.gcode", 3, False, "bmV3")
+
+        self.assertEqual("failed", self.plugin.get_download_state()["status"])
+        self.assertEqual(
+            "Could not save downloaded file: disk full",
+            self.plugin.get_download_state()["error"],
+        )
+        self.assertEqual([], self.plugin._plugin_manager.messages)
+
+    def test_save_programming_error_is_not_handled(self):
+        self.plugin._file_manager = FailingFileManager(TypeError("bad storage call"))
+
+        with self.assertRaises(TypeError):
+            self.plugin._save_download("cube.gcode", 3, False, "bmV3")
 
     def test_api_download_command_queues_transfer(self):
         self.plugin.on_api_command("download", {"filename": "cube.gcode"})

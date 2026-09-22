@@ -32,7 +32,6 @@ $(function() {
 
     class M6400DownloadViewModel {
         constructor(parameters) {
-            window.M6400DownloadViewModel = this;
             this.filesViewModel = parameters[0];
             this.loginState = parameters[1];
             this.access = parameters[2];
@@ -80,7 +79,6 @@ $(function() {
 
         _enablePrinterDownloadButtons() {
             if (!this.downloadPermission()) {
-                this._debug("Skipped enabling SD buttons; File Download permission is absent");
                 return;
             }
             $("a.btn-files-download").each((index, button) => {
@@ -150,7 +148,10 @@ $(function() {
             }
 
             this._enablePrinterDownloadButtons();
-            $(document).on("click.m6400Download", "a.btn-files-download", this._boundDownloadClickHandler);
+            $(document).on(
+                "click.m6400Download",
+                "a.btn-files-download",
+                this._boundDownloadClickHandler);
             this.downloadObserver = new MutationObserver((mutations) => {
                 this._enablePrinterDownloadButtons();
             });
@@ -169,7 +170,10 @@ $(function() {
 
             this.downloadObserver.disconnect();
             this.downloadObserver = null;
-            $(document).off("click.m6400Download", "a.btn-files-download", this._boundDownloadClickHandler);
+            $(document).off(
+                "click.m6400Download",
+                "a.btn-files-download",
+                this._boundDownloadClickHandler);
             $("a.btn-files-download").each((index, button) => {
                 if (this._isPrinterSdFile(ko.dataFor(button))) {
                     $(button).addClass("disabled").removeAttr("href");
@@ -206,6 +210,10 @@ $(function() {
                 hasDownloadPermission: this.downloadPermission()
             });
             this._installDownloadIntegration();
+            if (this._isDebuggingEnabled()) {
+                window.M6400DownloadViewModel = this;
+                this._debug("window.M6400DownloadViewModel set to", this);
+            }
         }
     }
 
