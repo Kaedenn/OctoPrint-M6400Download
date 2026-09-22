@@ -1,0 +1,5 @@
+include README.md
+include CHANGELOG.md
+recursive-include octoprint_M6400Download/templates *
+recursive-include octoprint_M6400Download/translations *
+recursive-include octoprint_M6400Download/static *

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OctoPrint-M6400Download"
+version = "0.1.0"
+description = "Allow for downloading files from the printer's SD card, using M6400 and M6401"
+authors = [
+    {name = "Kaedenn A. D. N.", email = "kaedenn@gmail.com"}
+]
+readme = {file = "README.md", content-type = "text/markdown"}
+dynamic = [
+    "license"
+]
+
+requires-python = ">=3.7, <4"
+
+# any additional requirements (besides OctoPrint) should be listed here
+dependencies = []
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = [
+    "octoprint_M6400Download",
+    "octoprint_M6400Download.*"
+]
+
+[project.entry-points."octoprint.plugin"]
+M6400Download = "octoprint_M6400Download"
+
+[project.urls]
+Homepage = "https://github.com/kaedenn/OctoPrint-M6400Download"
+
+[project.optional-dependencies]
+develop = [
+    "go-task-bin"
+]
