@@ -37,9 +37,10 @@ $(function() {
             this.loginState = parameters[1];
             this.access = parameters[2];
             this.settingsViewModel = parameters[3];
-            this.downloadPermission = this.loginState.hasPermissionKo(
-                this.access.permissions.FILES_DOWNLOAD
-            );
+            // OctoPrint initializes access.permissions after constructing view models.
+            this.downloadPermission = ko.pureComputed(() =>
+                this.loginState.hasPermission(this.access.permissions.FILES_DOWNLOAD)
+            ).extend({notify: "always"});
             this.downloadObserver = null;
             this._boundDownloadClickHandler = (event) => {
                 this._downloadClickHandler(event.currentTarget, event);
@@ -63,21 +64,18 @@ $(function() {
             var result = file &&
                 (file.origin === "printer" || file.origin === "sdcard") &&
                 file.type !== "folder";
-            this._debug("Checked file origin", {file: file, isPrinterSdFile: result});
             return result;
         }
 
         _enablePrinterDownloadButton(button) {
             var file = ko.dataFor(button);
             if (!this._isPrinterSdFile(file)) {
-                this._debug("Skipped non-SD download button", {button: button, file: file});
                 return;
             }
 
             // OctoPrint disables this anchor when the printer does not supply
             // a native download URL. M6400 provides that missing transport.
             $(button).removeClass("disabled").removeAttr("disabled").attr("href", "#");
-            this._debug("Enabled SD download button", {button: button, file: file});
         }
 
         _enablePrinterDownloadButtons() {
@@ -85,9 +83,6 @@ $(function() {
                 this._debug("Skipped enabling SD buttons; File Download permission is absent");
                 return;
             }
-            this._debug("Enabling all SD download buttons", {
-                count: $("a.btn-files-download").length
-            });
             $("a.btn-files-download").each((index, button) => {
                 this._enablePrinterDownloadButton(button);
             });
@@ -96,18 +91,52 @@ $(function() {
         _downloadClickHandler(button, event) {
             var file = ko.dataFor(button);
             if (!this._isPrinterSdFile(file) || $(button).hasClass("disabled")) {
-                this._debug("Ignored download click", {button: button, file: file});
                 return;
             }
 
             event.preventDefault();
             $(button).addClass("disabled");
-            this._debug("Requesting SD download", {filename: file.path, file: file});
+            this._requestDownload(button, file, false);
+        }
+
+        _downloadFilename(file) {
+            if (!file.display || /\s/.test(file.display)) {
+                return file.path;
+            }
+            var slash = file.path.lastIndexOf("/");
+            return file.path.slice(0, slash + 1) + file.display;
+        }
+
+        _requestDownload(button, file, force) {
+            var filename = this._downloadFilename(file);
+            this._debug("Requesting SD download", {filename: filename, file: file, force: force});
             OctoPrint.simpleApiCommand("M6400Download", "download", {
-                filename: file.path
-            }).fail(() => {
+                filename: filename,
+                force: force
+            }).fail((response) => {
+                if (!force && response.status === 409 &&
+                    response.responseJSON && response.responseJSON.error === "file_exists") {
+                    let confirmed = false;
+                    showConfirmationDialog({
+                        title: gettext("Overwrite file?"),
+                        message: gettext("A local file with this name already exists. It will be overwritten."),
+                        question: gettext("Do you want to continue?"),
+                        cancel: gettext("No"),
+                        proceed: gettext("Yes"),
+                        onproceed: () => {
+                            confirmed = true;
+                            this._requestDownload(button, file, true);
+                        },
+                        onclose: () => {
+                            if (!confirmed) {
+                                $(button).removeClass("disabled");
+                            }
+                        }
+                    });
+                    return;
+                }
                 $(button).removeClass("disabled");
-                this._debug("SD download request failed; button re-enabled", {filename: file.path});
+                this._debug("SD download request failed; button re-enabled", {filename: filename});
             });
         }
 
@@ -123,7 +152,6 @@ $(function() {
             this._enablePrinterDownloadButtons();
             $(document).on("click.m6400Download", "a.btn-files-download", this._boundDownloadClickHandler);
             this.downloadObserver = new MutationObserver((mutations) => {
-                this._debug("Observed file-list DOM changes", {mutationCount: mutations.length});
                 this._enablePrinterDownloadButtons();
             });
             this.downloadObserver.observe(document.body, {
@@ -150,6 +178,21 @@ $(function() {
             this._debug("Removed SD download integration and disabled SD buttons");
         }
 
+        onDataUpdaterPluginMessage(plugin, data) {
+            if (plugin !== "M6400Download" || !data ||
+                data.type !== "download_complete" || !this.downloadPermission()) {
+                return;
+            }
+            new PNotify({
+                title: gettext("Download complete"),
+                text: _.sprintf(gettext("Completed downloading %(path)s to %(file)s"), {
+                    path: _.escape(data.path),
+                    file: _.escape(data.file)
+                }),
+                type: "success"
+            });
+        }
+
         onStartupComplete() {
             this.downloadPermission.subscribe((allowed) => {
                 this._debug("File Download permission changed", {allowed: allowed});
@@ -166,13 +209,16 @@ $(function() {
         }
     }
 
-    /* view model class, parameters for constructor, container to bind to
-     * Please see http://docs.octoprint.org/en/main/plugins/viewmodels.html#registering-custom-viewmodels for more details
-     * and a full list of the available options.
-     */
     OCTOPRINT_VIEWMODELS.push({
         construct: M6400DownloadViewModel,
-        dependencies: ["filesViewModel", "loginStateViewModel", "accessViewModel", "settingsViewModel"],
+        dependencies: [
+            "filesViewModel",
+            "loginStateViewModel",
+            "accessViewModel",
+            "settingsViewModel"
+        ],
         elements: [ /* ... */ ]
     });
 });
+
+/* vim: set ts=4 sts=4 sw=4: */

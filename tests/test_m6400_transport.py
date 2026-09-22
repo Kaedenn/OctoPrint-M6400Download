@@ -93,6 +93,7 @@ class FakePrinter(object):
 class FakeFileManager(object):
     def __init__(self):
         self.files = {}
+        self.saved_path = None
 
     def file_exists(self, destination, filename):
         return filename in self.files
@@ -101,7 +102,15 @@ class FakeFileManager(object):
         if filename in self.files and not allow_overwrite:
             raise FileExistsError(filename)
         self.files[filename] = file_object.stream().read()
-        return filename
+        return self.saved_path or filename
+
+
+class FakePluginManager(object):
+    def __init__(self):
+        self.messages = []
+
+    def send_plugin_message(self, identifier, payload):
+        self.messages.append((identifier, payload))
 
 
 class M6400TransportTest(unittest.TestCase):
@@ -111,12 +120,19 @@ class M6400TransportTest(unittest.TestCase):
         self.file_manager = FakeFileManager()
         self.plugin._printer = self.printer
         self.plugin._file_manager = self.file_manager
+        self.plugin._plugin_manager = FakePluginManager()
+        self.plugin._identifier = "M6400Download"
 
     def _wait_for_save(self):
         deadline = time.time() + 1
         while self.plugin.get_download_state()["status"] == "saving" and time.time() < deadline:
             time.sleep(0.01)
         self.assertNotEqual("saving", self.plugin.get_download_state()["status"])
+
+    def _wait_for_message(self):
+        deadline = time.time() + 1
+        while not self.plugin._plugin_manager.messages and time.time() < deadline:
+            time.sleep(0.01)
 
     def test_collects_base64_response(self):
         self.plugin.request_download("cube.gcode")
@@ -128,16 +144,39 @@ class M6400TransportTest(unittest.TestCase):
         self.plugin.process_received_line(None, "B64_DATA " + encoded[4:])
         self.plugin.process_received_line(None, "B64_END")
         self._wait_for_save()
+        self._wait_for_message()
 
         self.assertEqual(encoded, self.plugin.get_download_base64())
         self.assertEqual("complete", self.plugin.get_download_state()["status"])
         self.assertEqual(b"G1 X1\n", self.file_manager.files["cube.gcode"])
+        self.assertEqual(
+            [("M6400Download", {"type": "download_complete", "path": "cube.gcode", "file": "cube.gcode"})],
+            self.plugin._plugin_manager.messages,
+        )
 
     def test_preserves_serial_line_and_records_firmware_failure(self):
         self.plugin.request_download("cube.gcode")
         self.assertEqual("B64_FAILURE", self.plugin.process_received_line(None, "B64_FAILURE"))
         self.assertEqual("failed", self.plugin.get_download_state()["status"])
         self.assertIsNone(self.plugin.get_download_base64())
+        self.assertEqual([], self.plugin._plugin_manager.messages)
+
+    def test_completion_message_uses_saved_file_path(self):
+        self.file_manager.saved_path = "LongName.gcode"
+        self.plugin.request_download("LONGNA~1.GCO")
+        self.plugin.process_received_line(None, "B64_BEGIN LONGNA~1.GCO 3")
+        self.plugin.process_received_line(None, "B64_DATA bmV3")
+        self.plugin.process_received_line(None, "B64_END")
+        self._wait_for_message()
+
+        self.assertEqual(
+            [("M6400Download", {
+                "type": "download_complete",
+                "path": "LONGNA~1.GCO",
+                "file": "LongName.gcode",
+            })],
+            self.plugin._plugin_manager.messages,
+        )
 
     def test_rejects_ambiguous_filenames(self):
         with self.assertRaises(ValueError):
@@ -146,6 +185,18 @@ class M6400TransportTest(unittest.TestCase):
     def test_api_download_command_queues_transfer(self):
         self.plugin.on_api_command("download", {"filename": "cube.gcode"})
         self.assertEqual([(["M6400 cube.gcode"], {"m6400download"})], self.printer.calls)
+
+    def test_api_existing_file_returns_conflict_and_accepts_force(self):
+        self.file_manager.files["cube.gcode"] = b"old"
+        self.assertEqual(
+            ({"error": "file_exists"}, 409),
+            self.plugin.on_api_command("download", {"filename": "cube.gcode"}),
+        )
+        self.assertEqual([], self.printer.calls)
+
+        self.plugin.on_api_command("download", {"filename": "cube.gcode", "force": True})
+        self.assertEqual([(["M6400 cube.gcode"], {"m6400download"})], self.printer.calls)
+        self.assertTrue(self.plugin.get_download_state()["force"])
 
     def test_debugging_defaults_to_false(self):
         self.assertEqual({"debugging": False}, self.plugin.get_settings_defaults())

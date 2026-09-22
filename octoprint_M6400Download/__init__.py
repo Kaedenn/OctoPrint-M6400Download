@@ -53,7 +53,10 @@ class M6400DownloadPlugin(
     @Permissions.FILES_DOWNLOAD.require(403)
     def on_api_command(self, command, data):
         if command == "download":
-            self.request_download(data["filename"], force=data.get("force", False))
+            try:
+                self.request_download(data["filename"], force=data.get("force", False))
+            except FileExistsError:
+                return {"error": "file_exists"}, 409
 
     def request_download(self, filename, force=False):
         """
@@ -161,7 +164,7 @@ class M6400DownloadPlugin(
                     "received {0} bytes, expected {1}".format(len(contents), expected_size)
                 )
             file_object = StreamWrapper(filename, io.BytesIO(contents))
-            self._file_manager.add_file(
+            saved_path = self._file_manager.add_file(
                 FileDestinations.LOCAL,
                 filename,
                 file_object,
@@ -174,6 +177,10 @@ class M6400DownloadPlugin(
         else:
             with self._download_lock:
                 self._download_status = "complete"
+            self._plugin_manager.send_plugin_message(
+                self._identifier,
+                {"type": "download_complete", "path": filename, "file": saved_path},
+            )
 
     ##~~ SettingsPlugin mixin
 
@@ -223,3 +230,5 @@ def __plugin_load__():
         "octoprint.comm.protocol.gcode.received": __plugin_implementation__.process_received_line,
         "octoprint.plugin.softwareupdate.check_config": __plugin_implementation__.get_update_information,
     }
+
+# vim: set ts=4 sts=4 sw=4:
