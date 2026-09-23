@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "OctoPrint-M6400Download"
-version = "0.1.0"
+version = "1.0.0"
 description = "Allow for downloading files from the printer's SD card, using M6400 and M6401"
 authors = [
     {name = "Kaedenn A. D. N.", email = "kaedenn@gmail.com"}
