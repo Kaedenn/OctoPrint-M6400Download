@@ -1,5 +1,9 @@
 # Change Log
 
+## v1.0.1
+
+Allow download requests to be triggered via either the serial terminal or via the UI.
+
 ## v1.0.0
 
 Initial release.
