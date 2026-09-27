@@ -4,6 +4,10 @@
 
 Allow download requests to be triggered via either the serial terminal or via the UI.
 
+Allow downloading of files that aren't gcode.
+
+Add notifications for download start, download end, and download failure.
+
 ## v1.0.0
 
 Initial release.
