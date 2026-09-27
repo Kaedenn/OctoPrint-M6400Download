@@ -1,8 +1,11 @@
 import base64
 import sys
+import tempfile
+from pathlib import Path
 import time
 import types
 import unittest
+from unittest.mock import Mock, patch
 
 
 plugin_module = types.ModuleType("octoprint.plugin")
@@ -48,44 +51,10 @@ class _Permissions(object):
 permissions_module.Permissions = _Permissions
 access_module.permissions = permissions_module
 octoprint_module.access = access_module
-filemanager_module = types.ModuleType("octoprint.filemanager")
-destinations_module = types.ModuleType("octoprint.filemanager.destinations")
-storage_module = types.ModuleType("octoprint.filemanager.storage")
-util_module = types.ModuleType("octoprint.filemanager.util")
-
-
-class _FileDestinations(object):
-    LOCAL = "local"
-
-
-class _StreamWrapper(object):
-    def __init__(self, filename, stream):
-        self.filename = filename
-        self._stream = stream
-
-    def stream(self):
-        return self._stream
-
-
-class _StorageError(Exception):
-    pass
-
-
-destinations_module.FileDestinations = _FileDestinations
-storage_module.StorageError = _StorageError
-util_module.StreamWrapper = _StreamWrapper
-filemanager_module.destinations = destinations_module
-filemanager_module.storage = storage_module
-filemanager_module.util = util_module
-octoprint_module.filemanager = filemanager_module
 sys.modules.setdefault("octoprint", octoprint_module)
 sys.modules.setdefault("octoprint.plugin", plugin_module)
 sys.modules.setdefault("octoprint.access", access_module)
 sys.modules.setdefault("octoprint.access.permissions", permissions_module)
-sys.modules.setdefault("octoprint.filemanager", filemanager_module)
-sys.modules.setdefault("octoprint.filemanager.destinations", destinations_module)
-sys.modules.setdefault("octoprint.filemanager.storage", storage_module)
-sys.modules.setdefault("octoprint.filemanager.util", util_module)
 
 from octoprint_M6400Download import M6400DownloadPlugin
 
@@ -106,47 +75,56 @@ class FailingPrinter(object):
         raise self.error
 
 
-class FakeFileManager(object):
-    def __init__(self):
-        self.files = {}
-        self.saved_path = None
-
-    def file_exists(self, destination, filename):
-        return filename in self.files
-
-    def add_file(self, destination, filename, file_object, allow_overwrite=False):
-        if filename in self.files and not allow_overwrite:
-            raise FileExistsError(filename)
-        self.files[filename] = file_object.stream().read()
-        return self.saved_path or filename
-
-
-class FailingFileManager(FakeFileManager):
-    def __init__(self, error):
-        super(FailingFileManager, self).__init__()
-        self.error = error
-
-    def add_file(self, destination, filename, file_object, allow_overwrite=False):
-        raise self.error
-
-
 class FakePluginManager(object):
     def __init__(self):
         self.messages = []
+        self.notices = []
 
     def send_plugin_message(self, identifier, payload):
-        self.messages.append((identifier, payload))
+        if payload["type"] == "download_notice":
+            self.notices.append((identifier, payload))
+        else:
+            self.messages.append((identifier, payload))
 
 
 class M6400TransportTest(unittest.TestCase):
     def setUp(self):
         self.plugin = M6400DownloadPlugin()
         self.printer = FakePrinter()
-        self.file_manager = FakeFileManager()
+        uploads = tempfile.TemporaryDirectory()
+        self.addCleanup(uploads.cleanup)
+        self.uploads = Path(uploads.name)
+        self.plugin._settings = Mock()
+        self.plugin._settings.global_get_basefolder.return_value = uploads.name
         self.plugin._printer = self.printer
-        self.plugin._file_manager = self.file_manager
         self.plugin._plugin_manager = FakePluginManager()
         self.plugin._identifier = "M6400Download"
+        self.plugin._logger = Mock()
+
+    def test_terminal_response_from_log(self):
+        filename = "ender3_status.gcode"
+        contents = b"M105\r\nM114\r\nM27\r\nM31\r\n"
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                self.setUp()
+                if existing:
+                    (self.uploads / filename).write_bytes(b"existing contents")
+                for line in (
+                    "B64_BEGIN ender3_status.gcode 22\r\n",
+                    "B64_DATA TTEwNQ0KTTExNA0KTTI3DQpNMzENCg==\r\n",
+                    "B64_END\r\n",
+                    "ok\r\n",
+                ):
+                    self.assertEqual(line, self.plugin.process_received_line(None, line))
+                self._wait_for_save()
+                if existing:
+                    self.assertEqual("failed", self.plugin.get_download_state()["status"])
+                    self.assertEqual(b"existing contents", (self.uploads / filename).read_bytes())
+                    self.plugin._logger.error.assert_called_once()
+                else:
+                    self.assertEqual("complete", self.plugin.get_download_state()["status"])
+                    self.assertEqual(contents, (self.uploads / filename).read_bytes())
+                    self.plugin._logger.error.assert_not_called()
 
     def _wait_for_save(self):
         deadline = time.time() + 1
@@ -173,7 +151,7 @@ class M6400TransportTest(unittest.TestCase):
 
         self.assertEqual(encoded, self.plugin.get_download_base64())
         self.assertEqual("complete", self.plugin.get_download_state()["status"])
-        self.assertEqual(b"G1 X1\n", self.file_manager.files["cube.gcode"])
+        self.assertEqual(b"G1 X1\n", (self.uploads / "cube.gcode").read_bytes())
         self.assertEqual(
             [("M6400Download", {"type": "download_complete", "path": "cube.gcode", "file": "cube.gcode"})],
             self.plugin._plugin_manager.messages,
@@ -192,7 +170,7 @@ class M6400TransportTest(unittest.TestCase):
                 self.assertEqual(line, self.plugin.process_received_line(None, line))
             self._wait_for_save()
             self.assertEqual("complete", self.plugin.get_download_state()["status"])
-            self.assertEqual(b"new", self.file_manager.files[filename])
+            self.assertEqual(b"new", (self.uploads / filename).read_bytes())
             self.assertEqual("bmV3", self.plugin.get_download_base64())
         self.assertEqual([], self.printer.calls)
 
@@ -206,18 +184,18 @@ class M6400TransportTest(unittest.TestCase):
         self._wait_for_save()
         self.assertEqual("complete", self.plugin.get_download_state()["status"])
         self.assertIsNone(self.plugin.get_download_state()["error"])
-        self.assertEqual({"new.gcode": b"new"}, self.file_manager.files)
+        self.assertEqual({"new.gcode": b"new"}, {p.name: p.read_bytes() for p in self.uploads.iterdir()})
 
     def test_external_transfer_does_not_inherit_overwrite_permission(self):
         self.plugin.request_download("requested.gcode", force=True)
-        self.file_manager.files["external.gcode"] = b"old"
+        (self.uploads / "external.gcode").write_bytes(b"old")
         self.plugin.process_received_line(None, "B64_BEGIN external.gcode 3")
         self.assertFalse(self.plugin.get_download_state()["force"])
         self.plugin.process_received_line(None, "B64_DATA bmV3")
         self.plugin.process_received_line(None, "B64_END")
         self._wait_for_save()
         self.assertEqual("failed", self.plugin.get_download_state()["status"])
-        self.assertEqual(b"old", self.file_manager.files["external.gcode"])
+        self.assertEqual(b"old", (self.uploads / "external.gcode").read_bytes())
 
     def test_completed_force_request_does_not_authorize_later_transfer(self):
         self.plugin.request_download("cube.gcode", force=True)
@@ -231,10 +209,9 @@ class M6400TransportTest(unittest.TestCase):
         self.plugin.process_received_line(None, "B64_END")
         self._wait_for_save()
         self.assertEqual("failed", self.plugin.get_download_state()["status"])
-        self.assertEqual(b"", self.file_manager.files["cube.gcode"])
+        self.assertEqual(b"", (self.uploads / "cube.gcode").read_bytes())
 
     def test_completion_message_uses_saved_file_path(self):
-        self.file_manager.saved_path = "LongName.gcode"
         self.plugin.request_download("LONGNA~1.GCO")
         self.plugin.process_received_line(None, "B64_BEGIN LONGNA~1.GCO 3")
         self.plugin.process_received_line(None, "B64_DATA bmV3")
@@ -245,7 +222,7 @@ class M6400TransportTest(unittest.TestCase):
             [("M6400Download", {
                 "type": "download_complete",
                 "path": "LONGNA~1.GCO",
-                "file": "LongName.gcode",
+                "file": "LONGNA~1.GCO",
             })],
             self.plugin._plugin_manager.messages,
         )
@@ -275,7 +252,7 @@ class M6400TransportTest(unittest.TestCase):
         self.assertEqual("waiting", self.plugin.get_download_state()["status"])
 
     def test_storage_error_marks_download_failed(self):
-        self.plugin._file_manager = FailingFileManager(_StorageError("disk full"))
+        self.plugin._write_download = Mock(side_effect=OSError("disk full"))
 
         self.plugin._save_download("cube.gcode", 3, False, "bmV3")
 
@@ -285,9 +262,26 @@ class M6400TransportTest(unittest.TestCase):
             self.plugin.get_download_state()["error"],
         )
         self.assertEqual([], self.plugin._plugin_manager.messages)
+        self.assertEqual(
+            {"type": "download_notice", "level": "error",
+             "message": "Could not save cube.gcode: disk full"},
+            self.plugin._plugin_manager.notices[-1][1],
+        )
+
+    def test_protocol_markers_display_notices_even_when_ignored(self):
+        self.plugin.process_received_line(None, "B64_BEGIN cube.gcode 3\r\n")
+        self.plugin.process_received_line(None, "B64_BEGIN other.gcode 3\r\n")
+        self.plugin.process_received_line(None, "B64_FAILURE")
+        self.plugin.process_received_line(None, "B64_END\r\n")
+        self.assertEqual(
+            ["Received B64_BEGIN cube.gcode 3 (transfer state: idle)",
+             "Received B64_BEGIN other.gcode 3 (transfer state: receiving)",
+             "Received B64_END (transfer state: failed)"],
+            [payload["message"] for _, payload in self.plugin._plugin_manager.notices],
+        )
 
     def test_save_programming_error_is_not_handled(self):
-        self.plugin._file_manager = FailingFileManager(TypeError("bad storage call"))
+        self.plugin._write_download = Mock(side_effect=TypeError("bad storage call"))
 
         with self.assertRaises(TypeError):
             self.plugin._save_download("cube.gcode", 3, False, "bmV3")
@@ -297,7 +291,7 @@ class M6400TransportTest(unittest.TestCase):
         self.assertEqual([(["M6400 cube.gcode"], {"m6400download"})], self.printer.calls)
 
     def test_api_existing_file_returns_conflict_and_accepts_force(self):
-        self.file_manager.files["cube.gcode"] = b"old"
+        (self.uploads / "cube.gcode").write_bytes(b"old")
         self.assertEqual(
             ({"error": "file_exists"}, 409),
             self.plugin.on_api_command("download", {"filename": "cube.gcode"}),
@@ -311,8 +305,50 @@ class M6400TransportTest(unittest.TestCase):
     def test_debugging_defaults_to_false(self):
         self.assertEqual({"debugging": False}, self.plugin.get_settings_defaults())
 
+    def test_arbitrary_extensions_are_saved_directly(self):
+        contents = b'{"version": 1}\n'
+        encoded = base64.b64encode(contents).decode("ascii")
+        for filename in ("marlin_config.json", "README", "folder/settings.bin"):
+            self.plugin.process_received_line(None, f"B64_BEGIN {filename} {len(contents)}")
+            self.plugin.process_received_line(None, "B64_DATA " + encoded)
+            self.plugin.process_received_line(None, "B64_END")
+            self._wait_for_save()
+            self.assertEqual("complete", self.plugin.get_download_state()["status"])
+            self.assertEqual(contents, (self.uploads / filename).read_bytes())
+
+    def test_rejects_traversal_and_symlinks(self):
+        for filename in ("../escape.json", "folder/../../escape", "folder\\escape"):
+            with self.subTest(filename=filename):
+                self.plugin._save_download(filename, 3, True, "bmV3")
+                self.assertEqual("failed", self.plugin.get_download_state()["status"])
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "target.json"
+            target.write_bytes(b"original")
+            (self.uploads / "link.json").symlink_to(target)
+            (self.uploads / "folder").symlink_to(outside, target_is_directory=True)
+            for filename in ("link.json", "folder/target.json"):
+                self.plugin._save_download(filename, 3, True, "bmV3")
+                self.assertEqual("failed", self.plugin.get_download_state()["status"])
+            self.assertEqual(b"original", target.read_bytes())
+
+    def test_failed_publish_preserves_existing_file_and_cleans_temporary(self):
+        target = self.uploads / "config.json"
+        target.write_bytes(b"original")
+        with patch("octoprint_M6400Download.os.replace", side_effect=OSError("disk error")):
+            self.plugin._save_download("config.json", 3, True, "bmV3")
+        self.assertEqual("failed", self.plugin.get_download_state()["status"])
+        self.assertEqual(b"original", target.read_bytes())
+        self.assertEqual([target], list(self.uploads.iterdir()))
+
+    def test_size_mismatch_does_not_replace_existing_file(self):
+        target = self.uploads / "config.json"
+        target.write_bytes(b"original")
+        self.plugin._save_download("config.json", 4, True, "bmV3")
+        self.assertEqual("failed", self.plugin.get_download_state()["status"])
+        self.assertEqual(b"original", target.read_bytes())
+
     def test_refuses_existing_file_unless_forced(self):
-        self.file_manager.files["cube.gcode"] = b"old"
+        (self.uploads / "cube.gcode").write_bytes(b"old")
         with self.assertRaises(FileExistsError):
             self.plugin.request_download("cube.gcode")
 
@@ -323,7 +359,7 @@ class M6400TransportTest(unittest.TestCase):
         self.plugin.process_received_line(None, "B64_END")
         self._wait_for_save()
 
-        self.assertEqual(b"new", self.file_manager.files["cube.gcode"])
+        self.assertEqual(b"new", (self.uploads / "cube.gcode").read_bytes())
 
 
 if __name__ == "__main__":

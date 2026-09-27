@@ -184,7 +184,18 @@ $(function() {
 
         onDataUpdaterPluginMessage(plugin, data) {
             if (plugin !== "M6400Download" || !data ||
-                data.type !== "download_complete" || !this.downloadPermission()) {
+                !this.downloadPermission()) {
+                return;
+            }
+            if (data.type === "download_notice") {
+                new PNotify({
+                    title: gettext("M6400 download"),
+                    text: _.escape(data.message),
+                    type: data.level === "error" ? "error" : "info"
+                });
+                return;
+            }
+            if (data.type !== "download_complete") {
                 return;
             }
             new PNotify({

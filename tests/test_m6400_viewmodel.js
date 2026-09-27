@@ -103,4 +103,12 @@ model.onDataUpdaterPluginMessage("other_plugin", {type: "download_complete"});
 model.onDataUpdaterPluginMessage("M6400Download", {type: "download_failed"});
 assert.strictEqual(notifications.length, 1);
 
+for (const level of ["info", "error"]) {
+    model.onDataUpdaterPluginMessage("M6400Download", {
+        type: "download_notice", message: "Received B64_END", level: level
+    });
+    assert.strictEqual(notifications[notifications.length - 1].type, level);
+    assert.strictEqual(notifications[notifications.length - 1].text, "Received B64_END");
+}
+
 console.log("M6400 view model filename checks passed");

@@ -8,14 +8,13 @@ Transport support for Marlin's M6400 base64 SD-card download command.
 import base64
 import binascii
 import io
+import os
 import re
+import tempfile
 import threading
 
 import octoprint.plugin
 from octoprint.access.permissions import Permissions
-from octoprint.filemanager.destinations import FileDestinations
-from octoprint.filemanager.storage import StorageError
-from octoprint.filemanager.util import StreamWrapper
 
 _B64_BEGIN = re.compile(r"^B64_BEGIN\s+(?P<filename>\S+)\s+(?P<size>\d+)\s*$")
 _B64_DATA = re.compile(r"^B64_DATA\s+(?P<data>[A-Za-z0-9+/=]+)\s*$")
@@ -84,7 +83,7 @@ class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
         with self._download_lock:
             if self._download_status in ("waiting", "receiving", "saving"):
                 raise RuntimeError("an M6400 download is already in progress")
-            if not force and self._file_manager.file_exists(FileDestinations.LOCAL, filename):
+            if not force and os.path.lexists(self._download_path(filename)):
                 raise FileExistsError(f"a local file named '{filename}' already exists")
 
             self._download_buffer = io.StringIO()
@@ -139,6 +138,10 @@ class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
         data = _B64_DATA.match(line)
 
         with self._download_lock:
+            if begin or line.strip() == "B64_END":
+                self._send_notice(
+                    f"Received {line.strip()} (transfer state: {self._download_status})"
+                )
             if begin and self._download_status not in ("receiving", "saving"):
                 force = (
                     self._download_status == "waiting"
@@ -177,9 +180,16 @@ class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
         # communication processing.
         return line
 
+    def _send_notice(self, message, level="info"):
+        """Display transfer diagnostics in connected OctoPrint clients."""
+        self._plugin_manager.send_plugin_message(
+            self._identifier,
+            {"type": "download_notice", "message": message, "level": level},
+        )
+
     def _save_download(self, filename, expected_size, force, encoded_data):
         """
-        Decode and add a completed transfer to OctoPrint's local storage.
+        Decode and write a completed transfer directly to the uploads folder.
         """
         try:
             contents = base64.b64decode(encoded_data.encode("ascii"), validate=True)
@@ -187,17 +197,13 @@ class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
                 raise ValueError(
                     f"received {len(contents)} bytes, expected {expected_size}"
                 )
-            file_object = StreamWrapper(filename, io.BytesIO(contents))
-            saved_path = self._file_manager.add_file(
-                FileDestinations.LOCAL,
-                filename,
-                file_object,
-                allow_overwrite=force,
-            )
-        except (binascii.Error, UnicodeError, ValueError, StorageError, OSError) as error:
+            saved_path = self._write_download(filename, contents, force)
+        except (binascii.Error, UnicodeError, ValueError, OSError) as error:
+            self._logger.error("Could not save downloaded file %r: %s", filename, error)
             with self._download_lock:
                 self._download_status = "failed"
                 self._download_error = f"Could not save downloaded file: {error}"
+            self._send_notice(f"Could not save {filename}: {error}", level="error")
         else:
             with self._download_lock:
                 self._download_status = "complete"
@@ -205,6 +211,41 @@ class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
                 self._identifier,
                 {"type": "download_complete", "path": filename, "file": saved_path},
             )
+
+    def _download_path(self, filename):
+        """Resolve an SD path inside uploads, rejecting traversal and symlinks."""
+        root = os.path.realpath(self._settings.global_get_basefolder("uploads"))
+        parts = filename.lstrip("/").split("/")
+        if any(part in ("", ".", "..") for part in parts) or "\\" in filename:
+            raise ValueError("invalid download path")
+        path = root
+        for part in parts:
+            path = os.path.join(path, part)
+            if os.path.islink(path):
+                raise ValueError("download path cannot contain symlinks")
+        if os.path.commonpath((root, os.path.realpath(path))) != root:
+            raise ValueError("download path must stay inside uploads")
+        return path
+
+    def _write_download(self, filename, contents, force):
+        """Publish a complete file without exposing partial writes."""
+        path = self._download_path(filename)
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".m6400-", delete=False) as output:
+                temporary = output.name
+                output.write(contents)
+            if force:
+                os.replace(temporary, path)
+            else:
+                # Linking fails atomically if another writer created the destination.
+                os.link(temporary, path)
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
+        return filename.lstrip("/")
 
     ##~~ SettingsPlugin mixin
 
