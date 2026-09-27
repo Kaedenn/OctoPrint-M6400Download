@@ -5,8 +5,6 @@
 Transport support for Marlin's M6400 base64 SD-card download command.
 """
 
-from __future__ import absolute_import
-
 import base64
 import binascii
 import io
@@ -16,9 +14,7 @@ import threading
 import octoprint.plugin
 from octoprint.access.permissions import Permissions
 from octoprint.filemanager.destinations import FileDestinations
-# This import is provided by OctoPrint and is absent from standalone lint environments.
-# pylint: disable-next=import-error,no-name-in-module
-from octoprint.filemanager.storage.common import StorageError
+from octoprint.filemanager.storage import StorageError
 from octoprint.filemanager.util import StreamWrapper
 
 _B64_BEGIN = re.compile(r"^B64_BEGIN\s+(?P<filename>\S+)\s+(?P<size>\d+)\s*$")
@@ -72,7 +68,7 @@ class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
 
     def request_download(self, filename, force=False):
         """
-        Queue ``M6400 <filename>`` and begin collecting its base64 response.
+        Queue ``M6400 <filename>`` with optional overwrite permission.
 
         The resulting text can be obtained with :meth:`get_download_base64`
         after the firmware sends ``B64_END``. Only one transfer is supported at
@@ -133,16 +129,28 @@ class M6400DownloadPlugin(  # pylint: disable=too-many-ancestors
 
     def process_received_line(self, _comm_instance, line, *_args, **_kwargs):
         """
-        Collect M6400 protocol lines and always preserve serial processing.
+        Collect M6400 responses regardless of who requested the command.
+
+        The firmware's begin record starts collection. Only a matching pending
+        request may authorize overwriting a local file; external transfers use
+        the default no-overwrite policy. Preserve normal serial processing.
         """
         begin = _B64_BEGIN.match(line)
         data = _B64_DATA.match(line)
 
         with self._download_lock:
-            if begin and self._download_status == "waiting":
+            if begin and self._download_status not in ("receiving", "saving"):
+                force = (
+                    self._download_status == "waiting"
+                    and self._download_filename == begin.group("filename")
+                    and self._download_force
+                )
+                self._download_buffer = io.StringIO()
                 self._download_filename = begin.group("filename")
                 self._download_size = int(begin.group("size"))
+                self._download_force = force
                 self._download_status = "receiving"
+                self._download_error = None
             elif data and self._download_status == "receiving":
                 self._download_buffer.write(data.group("data"))
             elif line.strip() == "B64_END" and self._download_status == "receiving":

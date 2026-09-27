@@ -51,7 +51,6 @@ octoprint_module.access = access_module
 filemanager_module = types.ModuleType("octoprint.filemanager")
 destinations_module = types.ModuleType("octoprint.filemanager.destinations")
 storage_module = types.ModuleType("octoprint.filemanager.storage")
-storage_common_module = types.ModuleType("octoprint.filemanager.storage.common")
 util_module = types.ModuleType("octoprint.filemanager.util")
 
 
@@ -73,7 +72,7 @@ class _StorageError(Exception):
 
 
 destinations_module.FileDestinations = _FileDestinations
-storage_common_module.StorageError = _StorageError
+storage_module.StorageError = _StorageError
 util_module.StreamWrapper = _StreamWrapper
 filemanager_module.destinations = destinations_module
 filemanager_module.storage = storage_module
@@ -86,7 +85,6 @@ sys.modules.setdefault("octoprint.access.permissions", permissions_module)
 sys.modules.setdefault("octoprint.filemanager", filemanager_module)
 sys.modules.setdefault("octoprint.filemanager.destinations", destinations_module)
 sys.modules.setdefault("octoprint.filemanager.storage", storage_module)
-sys.modules.setdefault("octoprint.filemanager.storage.common", storage_common_module)
 sys.modules.setdefault("octoprint.filemanager.util", util_module)
 
 from octoprint_M6400Download import M6400DownloadPlugin
@@ -187,6 +185,53 @@ class M6400TransportTest(unittest.TestCase):
         self.assertEqual("failed", self.plugin.get_download_state()["status"])
         self.assertIsNone(self.plugin.get_download_base64())
         self.assertEqual([], self.plugin._plugin_manager.messages)
+
+    def test_external_transfers_start_without_a_plugin_request(self):
+        for filename in ("first.gcode", "second.gcode"):
+            for line in (f"B64_BEGIN {filename} 3", "B64_DATA bmV3", "B64_END"):
+                self.assertEqual(line, self.plugin.process_received_line(None, line))
+            self._wait_for_save()
+            self.assertEqual("complete", self.plugin.get_download_state()["status"])
+            self.assertEqual(b"new", self.file_manager.files[filename])
+            self.assertEqual("bmV3", self.plugin.get_download_base64())
+        self.assertEqual([], self.printer.calls)
+
+    def test_external_transfer_recovers_after_firmware_failure(self):
+        self.plugin.process_received_line(None, "B64_BEGIN old.gcode 6")
+        self.plugin.process_received_line(None, "B64_DATA b2xk")
+        self.plugin.process_received_line(None, "B64_FAILURE")
+        self.plugin.process_received_line(None, "B64_BEGIN new.gcode 3")
+        self.plugin.process_received_line(None, "B64_DATA bmV3")
+        self.plugin.process_received_line(None, "B64_END")
+        self._wait_for_save()
+        self.assertEqual("complete", self.plugin.get_download_state()["status"])
+        self.assertIsNone(self.plugin.get_download_state()["error"])
+        self.assertEqual({"new.gcode": b"new"}, self.file_manager.files)
+
+    def test_external_transfer_does_not_inherit_overwrite_permission(self):
+        self.plugin.request_download("requested.gcode", force=True)
+        self.file_manager.files["external.gcode"] = b"old"
+        self.plugin.process_received_line(None, "B64_BEGIN external.gcode 3")
+        self.assertFalse(self.plugin.get_download_state()["force"])
+        self.plugin.process_received_line(None, "B64_DATA bmV3")
+        self.plugin.process_received_line(None, "B64_END")
+        self._wait_for_save()
+        self.assertEqual("failed", self.plugin.get_download_state()["status"])
+        self.assertEqual(b"old", self.file_manager.files["external.gcode"])
+
+    def test_completed_force_request_does_not_authorize_later_transfer(self):
+        self.plugin.request_download("cube.gcode", force=True)
+        self.plugin.process_received_line(None, "B64_BEGIN cube.gcode 0")
+        self.plugin.process_received_line(None, "B64_END")
+        self._wait_for_save()
+        self.assertEqual("complete", self.plugin.get_download_state()["status"])
+        self.plugin.process_received_line(None, "B64_BEGIN cube.gcode 3")
+        self.assertFalse(self.plugin.get_download_state()["force"])
+        self.plugin.process_received_line(None, "B64_DATA bmV3")
+        self.plugin.process_received_line(None, "B64_END")
+        self._wait_for_save()
+        self.assertEqual("failed", self.plugin.get_download_state()["status"])
+        self.assertEqual(b"", self.file_manager.files["cube.gcode"])
 
     def test_completion_message_uses_saved_file_path(self):
         self.file_manager.saved_path = "LongName.gcode"
