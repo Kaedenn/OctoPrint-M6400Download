@@ -221,10 +221,6 @@ $(function() {
                 hasDownloadPermission: this.downloadPermission()
             });
             this._installDownloadIntegration();
-            if (this._isDebuggingEnabled()) {
-                window.M6400DownloadViewModel = this;
-                this._debug("window.M6400DownloadViewModel set to", this);
-            }
         }
     }
 
